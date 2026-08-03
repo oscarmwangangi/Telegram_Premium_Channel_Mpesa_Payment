@@ -1,0 +1,2 @@
+-- RenameIndex
+ALTER INDEX "exchange_rate_snapshots_baseCurrency_targetCurrency_fetche_idx" RENAME TO "exchange_rate_snapshots_baseCurrency_targetCurrency_fetched_idx";

@@ -1,0 +1,380 @@
+// ============================================================================
+// Telegram Premium Channel Subscription Platform — Database Schema
+// ============================================================================
+// Design notes:
+// - Payment (intent) vs PaymentTransaction (raw gateway record) are separated
+//   deliberately: one Payment can have multiple gateway attempts/retries,
+//   and PaymentTransaction stores the immutable, idempotency-critical
+//   provider references (CheckoutRequestID, PayPal order id, M-Pesa receipt).
+// - Idempotency is enforced at the DB level via unique constraints on
+//   provider references, NOT just in application code.
+// - A partial unique index (added in a follow-up raw-SQL migration, see
+//   migrations/..._add_constraints/migration.sql) guarantees a user can
+//   never have two ACTIVE subscriptions at once, enforced by Postgres
+//   itself rather than only by application logic.
+// ============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ----------------------------------------------------------------------------
+// Enums
+// ----------------------------------------------------------------------------
+
+enum UserStatus {
+  ACTIVE
+  SUSPENDED
+  BANNED
+}
+
+enum AdminRole {
+  SUPER_ADMIN
+  ADMIN
+  SUPPORT
+}
+
+enum SubscriptionStatus {
+  PENDING // created, awaiting successful payment
+  ACTIVE
+  EXPIRED
+  CANCELLED
+}
+
+enum PaymentMethod {
+  MPESA
+  PAYPAL
+}
+
+enum Currency {
+  KES
+  USD
+}
+
+enum PaymentStatus {
+  PENDING
+  SUCCESS
+  FAILED
+  CANCELLED
+  TIMEOUT
+}
+
+enum TransactionProvider {
+  MPESA
+  PAYPAL
+}
+
+enum TransactionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
+
+enum ChannelAccessStatus {
+  PENDING_INVITE
+  INVITED
+  JOINED
+  REVOKED
+  EXPIRED
+}
+
+enum EmailType {
+  WELCOME
+  PAYMENT_CONFIRMATION
+  SUBSCRIPTION_ACTIVATED
+  RENEWAL_REMINDER_7D
+  RENEWAL_REMINDER_1D
+  SUBSCRIPTION_EXPIRED
+  PAYMENT_FAILED
+  RECEIPT
+  ANNOUNCEMENT
+}
+
+enum EmailStatus {
+  QUEUED
+  SENT
+  FAILED
+}
+
+enum ActorType {
+  ADMIN
+  SYSTEM
+  USER
+}
+
+// ----------------------------------------------------------------------------
+// Core: Users & Admins
+// ----------------------------------------------------------------------------
+
+model User {
+  id               String     @id @default(uuid())
+  telegramId       BigInt     @unique
+  telegramUsername String?
+  firstName        String?
+  lastName         String?
+  phoneNumber      String? // normalized E.164-ish, e.g. 2547XXXXXXXX
+  email            String?    @unique
+  status           UserStatus @default(ACTIVE)
+  createdAt        DateTime   @default(now())
+  updatedAt        DateTime   @updatedAt
+
+  subscriptions        Subscription[]
+  payments              Payment[]
+  telegramChannelAccess TelegramChannelAccess[]
+  emailNotifications    EmailNotification[]
+  auditLogsAsSubject    AuditLog[]               @relation("AuditLogUser")
+
+  @@index([phoneNumber])
+  @@index([status])
+  @@map("users")
+}
+
+model AdminUser {
+  id           String    @id @default(uuid())
+  email        String    @unique
+  passwordHash String
+  name         String
+  role         AdminRole @default(SUPPORT)
+  isActive     Boolean   @default(true)
+  lastLoginAt  DateTime?
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  sessions        AdminSession[]
+  auditLogsActed  AuditLog[]           @relation("AuditLogAdmin")
+  sentAnnouncements EmailNotification[] @relation("AnnouncementSentBy")
+
+  @@map("admin_users")
+}
+
+// Refresh-token sessions for JWT (httpOnly cookie) auth with rotation/revocation.
+model AdminSession {
+  id               String    @id @default(uuid())
+  adminUserId      String
+  admin            AdminUser @relation(fields: [adminUserId], references: [id], onDelete: Cascade)
+  refreshTokenHash String    @unique
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  @@index([adminUserId])
+  @@map("admin_sessions")
+}
+
+// ----------------------------------------------------------------------------
+// Subscription Plans & Subscriptions
+// ----------------------------------------------------------------------------
+
+model SubscriptionPlan {
+  id           String   @id @default(uuid())
+  code         String   @unique // e.g. "MONTHLY", "YEARLY"
+  name         String
+  description  String?
+  priceUsd     Decimal  @db.Decimal(10, 2)
+  durationDays Int
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  subscriptions Subscription[]
+  payments      Payment[]
+
+  @@map("subscription_plans")
+}
+
+model Subscription {
+  id          String             @id @default(uuid())
+  userId      String
+  user        User               @relation(fields: [userId], references: [id], onDelete: Cascade)
+  planId      String
+  plan        SubscriptionPlan   @relation(fields: [planId], references: [id])
+  status      SubscriptionStatus @default(PENDING)
+  startDate   DateTime?
+  endDate     DateTime?
+  autoRenew   Boolean            @default(false)
+  cancelledAt DateTime?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  payments             Payment[]
+  telegramChannelAccess TelegramChannelAccess[]
+
+  // NOTE: a partial unique index enforcing "only one ACTIVE subscription per
+  // user" is added via raw SQL migration since Prisma's schema syntax does
+  // not yet support partial unique indexes natively.
+  @@index([userId])
+  @@index([status])
+  @@index([endDate])
+  @@map("subscriptions")
+}
+
+// ----------------------------------------------------------------------------
+// Payments & Transactions
+// ----------------------------------------------------------------------------
+
+// A Payment represents a single checkout attempt/intent for a plan.
+model Payment {
+  id             String        @id @default(uuid())
+  userId         String
+  user           User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId String?
+  subscription   Subscription? @relation(fields: [subscriptionId], references: [id])
+  planId         String
+  plan           SubscriptionPlan @relation(fields: [planId], references: [id])
+
+  method         PaymentMethod
+  amount         Decimal       @db.Decimal(12, 2) // amount in `currency`
+  currency       Currency
+  amountUsd      Decimal       @db.Decimal(12, 2) // normalized for reporting
+  exchangeRate   Decimal?      @db.Decimal(12, 6) // rate used, if converted
+
+  status         PaymentStatus @default(PENDING)
+  initiatedAt    DateTime      @default(now())
+  completedAt    DateTime?
+  failureReason  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions PaymentTransaction[]
+
+  @@index([userId])
+  @@index([status])
+  @@index([method])
+  @@index([createdAt])
+  @@map("payments")
+}
+
+// The raw, provider-level record. This is the idempotency boundary:
+// unique constraints here prevent a retried/duplicate gateway callback
+// from ever being processed twice.
+model PaymentTransaction {
+  id        String              @id @default(uuid())
+  paymentId String
+  payment   Payment             @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  provider  TransactionProvider
+
+  // M-Pesa specific
+  merchantRequestId  String?
+  checkoutRequestId  String?    @unique
+  mpesaReceiptNumber String?    @unique
+
+  // PayPal specific
+  paypalOrderId String? @unique
+  paypalPayerId String?
+
+  rawRequestPayload  Json?
+  rawCallbackPayload Json?
+
+  resultCode Int?
+  resultDesc String?
+  status     TransactionStatus @default(PENDING)
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([paymentId])
+  @@index([provider])
+  @@map("payment_transactions")
+}
+
+// Cached snapshots of exchange rates used for KES/USD display + conversion,
+// with a source + timestamp so stale/fallback rates are auditable.
+model ExchangeRateSnapshot {
+  id             String   @id @default(uuid())
+  baseCurrency   Currency
+  targetCurrency Currency
+  rate           Decimal  @db.Decimal(12, 6)
+  source         String
+  fetchedAt      DateTime @default(now())
+
+  @@index([baseCurrency, targetCurrency, fetchedAt])
+  @@map("exchange_rate_snapshots")
+}
+
+// ----------------------------------------------------------------------------
+// Telegram Channel Access
+// ----------------------------------------------------------------------------
+
+model TelegramChannelAccess {
+  id                  String              @id @default(uuid())
+  userId              String
+  user                User                @relation(fields: [userId], references: [id], onDelete: Cascade)
+  subscriptionId      String
+  subscription        Subscription        @relation(fields: [subscriptionId], references: [id], onDelete: Cascade)
+  channelId           String
+  inviteLink          String?
+  inviteLinkExpiresAt DateTime?
+  joinedAt            DateTime?
+  status              ChannelAccessStatus @default(PENDING_INVITE)
+  revokedAt           DateTime?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([userId])
+  @@index([subscriptionId])
+  @@index([status])
+  @@map("telegram_channel_access")
+}
+
+// ----------------------------------------------------------------------------
+// Email Notifications
+// ----------------------------------------------------------------------------
+
+model EmailNotification {
+  id             String      @id @default(uuid())
+  userId         String?
+  user           User?       @relation(fields: [userId], references: [id], onDelete: SetNull)
+  type           EmailType
+  recipientEmail String
+  subject        String
+  status         EmailStatus @default(QUEUED)
+  sentAt         DateTime?
+  errorMessage   String?
+  metadata       Json?
+
+  // set only for admin-triggered ANNOUNCEMENT broadcasts
+  sentByAdminId String?
+  sentByAdmin   AdminUser? @relation("AnnouncementSentBy", fields: [sentByAdminId], references: [id])
+
+  createdAt DateTime @default(now())
+
+  @@index([userId])
+  @@index([type])
+  @@index([status])
+  @@map("email_notifications")
+}
+
+// ----------------------------------------------------------------------------
+// Audit Log
+// ----------------------------------------------------------------------------
+
+model AuditLog {
+  id          String    @id @default(uuid())
+  actorType   ActorType
+  adminUserId String?
+  adminUser   AdminUser? @relation("AuditLogAdmin", fields: [adminUserId], references: [id], onDelete: SetNull)
+  userId      String?
+  user        User?      @relation("AuditLogUser", fields: [userId], references: [id], onDelete: SetNull)
+
+  action     String // e.g. "SUBSCRIPTION_EXTENDED", "USER_SUSPENDED"
+  entityType String // e.g. "Subscription", "User", "Payment"
+  entityId   String
+  metadata   Json?
+  ipAddress  String?
+
+  createdAt DateTime @default(now())
+
+  @@index([entityType, entityId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("audit_logs")
+}

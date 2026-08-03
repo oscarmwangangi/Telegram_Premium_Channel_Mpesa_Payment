@@ -1,0 +1,62 @@
+# Dependencies
+node_modules/
+.pnpm-store/
+.yarn/
+package-lock.json
+yarn.lock
+pnpm-lock.yaml
+
+# Environment Variables & Secrets (CRITICAL)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Build & Output Directories
+dist/
+build/
+.next/
+out/
+bin/
+
+# TypeScript & Compiler Outputs
+*.tsbuildinfo
+tsconfig.tsbuildinfo
+
+# Prisma & Database
+# Uncomment if using SQLite or temporary dev databases
+# prisma/dev.db
+# prisma/dev.db-journal
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS / System Files
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# IDEs & Code Editors
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+.idea/
+*.swp
+*.swo
+
+# Testing & Coverage
+coverage/
+.nyc_output/
+
+# Temporary / Cache Files
+.cache/
+.eslintcache
+.turbo/
