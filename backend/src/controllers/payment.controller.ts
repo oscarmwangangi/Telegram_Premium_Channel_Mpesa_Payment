@@ -77,3 +77,14 @@ export const paypalWebhookHandler = asyncHandler(async (req: Request, res: Respo
 
   return res.sendStatus(200);
 });
+
+// export async function handlePaypalReturnHandler(req: Request, res: Response) {
+//   const { token, PayerID } = req.query;
+
+//   try {
+   
+//     res.redirect(`${process.env.FRONTEND_URL}/payment-success?orderId=${token}`);
+//   } catch (error) {
+//     res.redirect(`${process.env.FRONTEND_URL}/payment-failed`);
+//   }
+// }

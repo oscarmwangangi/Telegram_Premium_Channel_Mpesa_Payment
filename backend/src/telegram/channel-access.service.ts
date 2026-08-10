@@ -35,9 +35,9 @@ export async function grantChannelAccess(
   let link: TelegramBot.ChatInviteLink;
   try {
     link = await bot.createChatInviteLink(env.CHANNEL_ID, {
-      // member_limit: 1,
+      member_limit: 2, // 1 for the user + 1 for the bot itself (which is required to create the link)
       expire_date: expireDate,
-      creates_join_request: true,
+      creates_join_request: false,
     });
   } catch (err) {
     logger.error({ err, userId: user.id }, "Failed to create Telegram invite link");
